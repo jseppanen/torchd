@@ -26,7 +26,7 @@ torchd --model traced_bert.pt
 
 Make an HTTP request
 ```
-curl -H 'Content-Type: application/json' --data '{"inputs": [[[101, 2040, 2001, 3958, 27227, 1029, 102, 3958, 103, 2001, 1037, 13997, 11510, 102]], [[0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1]]]}' http://127.0.0.1:7000/forward
+curl -H 'Content-Type: application/json' --data '{"inputs": [[[101, 2040, 2001, 3958, 27227, 1029, 102, 3958, 103, 2001, 1037, 13997, 11510, 102]], [[0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1]]]}' http://127.0.0.1:7777/forward
 ```
 
 Stop `torchd` server
@@ -43,7 +43,7 @@ Options
   --model PATH     Load TorchScript model from PATH (required)
   --device STRING  Run model on device (default cpu)
   --host STRING    Bind at host (default 127.0.0.1)
-  --port INTEGER   Listen at port (default 7000)
+  --port INTEGER   Listen at port (default 7777)
   --pidfile PATH   Print PID to file
   --help           Show this message and exit
 ```

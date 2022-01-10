@@ -294,7 +294,7 @@ public:
     model_path = parse_option(argc, argv, "--model", "");
     device_name = parse_option(argc, argv, "--device", "cpu");
     host = parse_option(argc, argv, "--host", "127.0.0.1");
-    std::string port_string = parse_option(argc, argv, "--port", "7000");
+    std::string port_string = parse_option(argc, argv, "--port", "7777");
     pidfile_path = parse_option(argc, argv, "--pidfile", "");
     try {
       port = std::stoi(port_string);
@@ -311,7 +311,7 @@ public:
           << "  --model PATH     Load TorchScript model from PATH (required)\n"
           << "  --device STRING  Run model on device (default cpu)\n"
           << "  --host STRING    Bind at host (default 127.0.0.1)\n"
-          << "  --port INTEGER   Listen at port (default 7000)\n"
+          << "  --port INTEGER   Listen at port (default 7777)\n"
           << "  --pidfile PATH   Print PID to file\n"
           << "  --help           Show this message and exit\n";
       exit(1);
