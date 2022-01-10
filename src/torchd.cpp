@@ -7,10 +7,13 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include "SignalHandler.h"
 #include "httplib.h"
 #include "simdjson.h"
 
@@ -23,8 +26,11 @@ using namespace torch::jit;
 void log(const std::string &msg) {
   const auto time =
       std::chrono::system_clock::to_time_t(std::chrono::system_clock::now());
+  auto pid = getpid();
+  auto tid = std::this_thread::get_id();
+  // XXX locking
   std::cout << std::put_time(std::localtime(&time), "%F %T") << " torchd["
-            << getpid() << "] " << msg << std::endl
+            << pid << " " << tid << "] " << msg << std::endl
             << std::flush;
 }
 
@@ -79,9 +85,9 @@ inline torch::Tensor parse_json_tensor(ondemand::array array) {
   }
 }
 
-std::vector<IValue> parse_json_inputs(const std::string &padded_buf,
+std::vector<IValue> parse_json_inputs(const std::string &json_input,
                                       ondemand::parser &parser) {
-  ondemand::document doc = parser.iterate(padded_buf);
+  ondemand::document doc = parser.iterate(json_input);
   std::vector<IValue> inputs;
 
   try {
@@ -189,33 +195,67 @@ inline void dump_json_ivalue(const IValue &value, std::string &json_output) {
   }
 }
 
-void forward(script::Module &model, std::string &padded_buf,
-             ondemand::parser &parser) {
-  auto inputs = parse_json_inputs(padded_buf, parser);
+std::string forward(script::Module &model, const c10::Device &device,
+                    std::mutex &device_mutex, const std::string &json_input) {
+  ondemand::parser parser;
+  std::string padded_input(json_input);
+  padded_input.reserve(padded_input.size() + SIMDJSON_PADDING);
+  std::vector<IValue> inputs = parse_json_inputs(padded_input, parser);
   IValue output;
 
-  try {
-    // XXX move tensors to correct device
-    output = model.forward(inputs);
-  } catch (const c10::Error &error) {
-    std::ofstream fin("/tmp/torchd_failed_inputs.json");
-    fin << padded_buf;
-    fin.close();
-    std::ofstream ferr("/tmp/torchd_failed_error.log");
-    ferr << error.what();
-    ferr.close();
-    log("ERROR forward failed, saved inputs to /tmp/torchd_failed_inputs.json "
-        "and error to /tmp/torchd_failed_error.log");
-    throw;
+  {
+    // exclusive GPU access block
+    std::lock_guard<std::mutex> guard(device_mutex);
+
+    /* getting:
+    RuntimeError: Inference tensors cannot be saved for backward. To work around
+    you can make a clone to get a normal tensor and use it in autograd.
+    https://github.com/pytorch/pytorch/issues/60333
+    */
+    // c10::InferenceMode guard;
+    torch::NoGradGuard no_grad;
+
+    // move inputs to GPU if needed
+    for (auto iter = inputs.begin(); iter != inputs.end(); ++iter) {
+      *iter = (*iter).toTensor().to(device);
+    }
+
+    try {
+      output = model.forward(inputs);
+    } catch (const c10::Error &error) {
+      std::ofstream fin("/tmp/torchd_inputs.json");
+      fin << json_input;
+      fin.close();
+      std::ofstream ferr("/tmp/torchd_error.txt");
+      ferr << error.what();
+      ferr.close();
+      log("ERROR forward failed, see /tmp/torchd_inputs.json and "
+          "/tmp/torchd_error.txt");
+      throw;
+    }
+
+    // move output(s) back to CPU if needed
+    if (output.isTuple()) {
+      auto tuple = output.toTuple();
+      std::vector<IValue> cpu_tensors;
+      for (auto elem : tuple->elements()) {
+        cpu_tensors.push_back(IValue(elem.toTensor().to(torch::kCPU)));
+      }
+      output = torch::ivalue::Tuple::create(cpu_tensors);
+    } else if (output.isTensor()) {
+      output = IValue(output.toTensor().to(torch::kCPU));
+    } else {
+      throw std::runtime_error(
+          "invalid result type, expected tensor or tuple of tensors, but got " +
+          output.tagKind());
+    }
   }
 
-  // XXX move tensors back to CPU
-
-  // reuse input buffer
-  padded_buf.clear();
-  padded_buf.append("{\"output\":");
-  dump_json_ivalue(output, padded_buf);
-  padded_buf.append("}");
+  std::string json_output;
+  json_output.append("{\"output\":");
+  dump_json_ivalue(output, json_output);
+  json_output.append("}\n");
+  return json_output;
 }
 
 class Args {
@@ -227,6 +267,7 @@ public:
   std::string device_name;
   std::string host;
   int port;
+  std::string pidfile_path;
 
   static bool parse_flag(int argc, char **argv, const std::string &option) {
     char **end = argv + argc;
@@ -254,6 +295,7 @@ public:
     device_name = parse_option(argc, argv, "--device", "cpu");
     host = parse_option(argc, argv, "--host", "127.0.0.1");
     std::string port_string = parse_option(argc, argv, "--port", "7000");
+    pidfile_path = parse_option(argc, argv, "--pidfile", "");
     try {
       port = std::stoi(port_string);
     } catch (std::exception &error) {
@@ -270,6 +312,7 @@ public:
           << "  --device STRING  Run model on device (default cpu)\n"
           << "  --host STRING    Bind at host (default 127.0.0.1)\n"
           << "  --port INTEGER   Listen at port (default 7000)\n"
+          << "  --pidfile PATH   Print PID to file\n"
           << "  --help           Show this message and exit\n";
       exit(1);
     }
@@ -290,39 +333,32 @@ int main(int argc, char *argv[]) {
   Args args;
   args.parse(argc, argv);
 
+  // Block signals in this thread.
+  // Threads spawned later will inherit the signal mask.
+  sgnl::SignalHandler signal_handler({SIGINT, SIGTERM});
+
   try {
     c10::Device d(args.device_name);
   } catch (const c10::Error &error) {
     log("ERROR Unknown device: \"" + args.device_name + "\": " + error.what());
-    return 1;
+    return EXIT_FAILURE;
   }
 
   script::Module model;
   c10::Device device(args.device_name);
+  std::mutex device_mutex;
 
   try {
     model = torch::jit::load(args.model_path.c_str(), device);
+    model.to(device);
   } catch (const c10::Error &error) {
     log("ERROR Failed to load model: \"" + args.model_path +
         "\": " + error.what());
-    return 1;
+    return EXIT_FAILURE;
   }
 
-  model.to(device);
-
   Server svr;
-  std::string json_data;
-  ondemand::parser parser;
-  /* getting:
-  RuntimeError: Inference tensors cannot be saved for backward. To work around
-  you can make a clone to get a normal tensor and use it in autograd.
-  https://github.com/pytorch/pytorch/issues/60333
-  */
-  // c10::InferenceMode guard;
-  torch::NoGradGuard no_grad;
-
   svr.set_payload_max_length(MAX_INPUT_SIZE);
-  json_data.reserve(MAX_INPUT_SIZE + SIMDJSON_PADDING);
 
   svr.Get("/", [](const Request & /*req*/, Response &res) {
     res.set_content("<html><h1>torchd ready</h1></html>\n", "text/html");
@@ -333,21 +369,14 @@ int main(int argc, char *argv[]) {
   });
 
   svr.Post("/forward", [&](const Request &req, Response &res) {
-    if (!req.has_file("data")) {
-      res.status = 400;
-      res.set_content("no data", "text/plain");
-      return;
+    std::string content_type = req.get_header_value("Content-Type");
+    if (content_type != "application/json") {
+      throw std::runtime_error(
+          "wrong Content-Type, expecting \"application/json\", but got \"" +
+          content_type + "\"");
     }
-    if (req.files.size() > MAX_INPUT_SIZE) {
-      res.status = 400;
-      res.set_content("too much data", "text/plain");
-      return;
-    }
-
-    const auto &file = req.get_file_value("data");
-    json_data.assign(file.content);
-    forward(model, json_data, parser);
-    res.set_content(json_data, "application/json");
+    std::string result = forward(model, device, device_mutex, req.body);
+    res.set_content(result, "application/json");
   });
 
   svr.set_error_handler([](const Request &req, Response &res) {
@@ -362,8 +391,23 @@ int main(int argc, char *argv[]) {
         res.status = 500;
       });
 
-  log("INFO torchd listening at http://" + args.host + ":" +
+  if (args.pidfile_path != "") {
+    std::ofstream fpid(args.pidfile_path);
+    fpid << getpid() << std::endl;
+    fpid.close();
+  }
+
+  auto fut_stop_signal =
+      std::async(std::launch::async, &sgnl::SignalHandler::sigwait_handler,
+                 &signal_handler, [&svr](int /*signum*/) {
+                   svr.stop();
+                   return true;
+                 });
+
+  log("INFO listening at http://" + args.host + ":" +
       std::to_string(args.port));
   svr.listen(args.host.c_str(), args.port);
-  return 0;
+  fut_stop_signal.get();
+  log("INFO exiting");
+  return EXIT_SUCCESS;
 }
